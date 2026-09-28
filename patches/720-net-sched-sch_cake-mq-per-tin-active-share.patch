@@ -1,0 +1,260 @@
+From: Segalmen <249970175+Segalmen@users.noreply.github.com>
+Subject: [PATCH] net/sched: sch_cake: experimental cake_mq per-tin active share
+
+With cake_mq, every sync recomputes all DiffServ tin thresholds from the
+local share (global rate / active instances). A priority flow that lands
+on a single instance therefore only gets a fraction of its tin share
+(measured: 25 % of plain cake in diffserv4, ~50 % in diffserv8).
+
+New runtime knob, off by default (debugfs cake_mq/tin_share):
+  0 = upstream behaviour
+  1 = each tin's global rate is divided by the number of instances that
+      recently carried traffic in that tin (the instance itself always
+      counted for its own threshold). The instance shaper keeps its local
+      share, so the global limit is unchanged.
+
+A tin counts as active on an instance for tin_hold * sync_time after its
+last dequeue (default 8 * 200 us). Each instance publishes its last
+dequeue time per tin; siblings read it during sync with READ_ONCE, same
+RCU pattern as the existing sync code (only fields stored in the
+instance itself are read, never another instance's tins or config).
+
+Also adds active_hold (default 0 = upstream): an instance counts as
+active if it sent within the last active_hold * sync_time. The per-tin
+measurements were taken with active_hold=8.
+
+Counters in debugfs cake_mq/stats (egress / ingress): syncs and
+tin_nact_sum per tin; tin_nact_sum / syncs = average number of instances
+seen active in each tin. Any write to stats resets them.
+
+Applies on top of OpenWrt 25.12 (kernel 6.12 cake_mq backport, patches
+700-02..701-02), with or without 701-03.
+---
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -71,6 +71,8 @@
+ #include <net/pkt_cls.h>
+ #include <net/tcp.h>
+ #include <net/flow_dissector.h>
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
+ 
+ #if IS_ENABLED(CONFIG_NF_CONNTRACK)
+ #include <net/netfilter/nf_conntrack_core.h>
+@@ -265,8 +267,35 @@
+ 	u64		last_checked_active;
+ 	u64		last_active;
+ 	u32		active_queues;
++
++	/* cake_mq per-tin active share: last dequeue time per tin,
++	 * read by sibling instances during sync
++	 */
++	u64		tin_last_active[CAKE_MAX_TINS];
++};
++
++/* cake_mq experimental runtime knobs (debugfs cake_mq/), all off by default:
++ *  tin_share:   0 = upstream (tin thresholds from the local share)
++ *               1 = each tin's global rate is split among the instances
++ *                   that recently carried that tin
++ *  tin_hold:    a tin stays active on an instance for N * sync_time
++ *               after its last dequeue (default 8)
++ *  active_hold: 0 = upstream activity test; N = an instance counts as
++ *               active if it sent within the last N * sync_time
++ */
++static u32 g_mq_tin_share;
++static u32 g_mq_tin_hold = 8;
++static u32 g_mq_active_hold;
++static struct dentry *cake_mq_dbg;
++
++/* verification counters, index 0 = egress, 1 = ingress */
++struct cake_mq_stats {
++	atomic64_t syncs;
++	atomic64_t tin_nact_sum[CAKE_MAX_TINS];
+ };
+ 
++static struct cake_mq_stats g_mq_stats[2];
++
+ enum {
+ 	CAKE_FLAG_OVERHEAD	   = BIT(0),
+ 	CAKE_FLAG_AUTORATE_INGRESS = BIT(1),
+@@ -1361,6 +1390,26 @@
+ 	return elig_ack;
+ }
+ 
++static void cake_set_rate(struct cake_tin_data *b, u64 rate, u32 mtu,
++			  u64 target_ns, u64 rtt_est_ns);
++
++/* Change only the instance hard-shaper rate, leaving tin thresholds
++ * untouched.  Same conversion as cake_set_rate().
++ */
++static void cake_mq_set_shaper_rate(struct cake_sched_data *q, u64 rate)
++{
++	u64 rate_ns = ((u64)NSEC_PER_SEC) << 34;
++	u16 rate_shft = 34;
++
++	rate_ns = div64_u64(rate_ns, max_t(u64, 64, rate));
++	while (!!(rate_ns >> 34)) {
++		rate_ns >>= 1;
++		rate_shft--;
++	}
++	q->rate_ns = rate_ns;
++	q->rate_shft = rate_shft;
++}
++
+ static u64 cake_ewma(u64 avg, u64 sample, u32 shift)
+ {
+ 	avg -= avg >> shift;
+@@ -2021,8 +2070,17 @@
+ 		struct Qdisc *other_sch;
+ 		u32 num_active_qs = 1;
+ 		unsigned int ntx;
++		u64 rate = q->config->rate_bps;
++		u32 tin_share = READ_ONCE(g_mq_tin_share);
++		u64 hold = (u64)READ_ONCE(g_mq_active_hold) * q->config->sync_time;
++		u64 tin_hold = (u64)max_t(u32, READ_ONCE(g_mq_tin_hold), 1) *
++			       q->config->sync_time;
++		u32 tin_others[CAKE_MAX_TINS] = { 0 };
++		struct cake_mq_stats *st;
+ 
+ 		for (ntx = 0; ntx < dev->num_tx_queues; ntx++) {
++			bool active;
++
+ 			other_sch = rcu_dereference(netdev_get_tx_queue(dev, ntx)->qdisc_sleeping);
+ 			other_priv = qdisc_priv(other_sch);
+ 
+@@ -2032,14 +2090,58 @@
+ 			other_qlen = READ_ONCE(other_sch->q.qlen);
+ 			other_last_active = READ_ONCE(other_priv->last_active);
+ 
+-			if (other_qlen || other_last_active > q->last_checked_active)
++			if (tin_share) {
++				u32 i;
++
++				for (i = 0; i < q->tin_cnt; i++)
++					if (READ_ONCE(other_priv->tin_last_active[i]) +
++					    tin_hold >= now)
++						tin_others[i]++;
++			}
++
++			if (hold)
++				active = other_qlen || other_last_active + hold >= now;
++			else
++				active = other_qlen ||
++					 other_last_active > q->last_checked_active;
++			if (active)
+ 				num_active_qs++;
+ 		}
+ 
+ 		if (num_active_qs > 1)
+-			new_rate = div64_u64(q->config->rate_bps, num_active_qs);
++			new_rate = div64_u64(rate, num_active_qs);
+ 
+-		cake_configure_rates(sch, new_rate, true);
++		if (tin_share && new_rate < rate) {
++			/* tin thresholds from the global rate, each divided by
++			 * the number of instances carrying that tin (this
++			 * instance always counted for its own threshold);
++			 * the instance shaper keeps its local share
++			 */
++			cake_configure_rates(sch, rate, true);
++			for (ntx = 0; ntx < q->tin_cnt; ntx++) {
++				struct cake_tin_data *b = &q->tins[ntx];
++				u32 n = tin_others[ntx] + 1;
++
++				if (n > 1 && b->tin_rate_bps)
++					cake_set_rate(b, div_u64(b->tin_rate_bps, n),
++						      0, 0, 0);
++			}
++			cake_mq_set_shaper_rate(q, new_rate);
++		} else {
++			cake_configure_rates(sch, new_rate, true);
++		}
++
++		st = &g_mq_stats[!!(q->config->rate_flags & CAKE_FLAG_INGRESS)];
++		atomic64_inc(&st->syncs);
++		if (tin_share) {
++			for (ntx = 0; ntx < q->tin_cnt; ntx++) {
++				u32 n = tin_others[ntx];
++
++				if (READ_ONCE(q->tin_last_active[ntx]) + tin_hold >= now)
++					n++;
++				atomic64_add(n, &st->tin_nact_sum[ntx]);
++			}
++		}
+ 		q->last_checked_active = now;
+ 		q->active_queues = num_active_qs;
+ 	}
+@@ -2253,6 +2355,7 @@
+ 	b->base_delay = cake_ewma(b->base_delay, delay,
+ 				  delay < b->base_delay ? 2 : 8);
+ 
++	WRITE_ONCE(q->tin_last_active[q->cur_tin], now);
+ 	len = cake_advance_shaper(q, b, skb, now, false);
+ 	flow->deficit -= len;
+ 	b->tin_deficit -= len;
+@@ -3343,6 +3446,39 @@
+ };
+ MODULE_ALIAS_NET_SCH("cake_mq");
+ 
++static int cake_mq_stats_show(struct seq_file *m, void *v)
++{
++	static const char * const dir[] = { "egress", "ingress" };
++	int d, i;
++
++	for (d = 0; d < 2; d++) {
++		struct cake_mq_stats *st = &g_mq_stats[d];
++
++		seq_printf(m, "%s: syncs %lld tin_nact_sum", dir[d],
++			   (s64)atomic64_read(&st->syncs));
++		for (i = 0; i < CAKE_MAX_TINS; i++)
++			seq_printf(m, " %lld",
++				   (s64)atomic64_read(&st->tin_nact_sum[i]));
++		seq_puts(m, "\n");
++	}
++	return 0;
++}
++
++/* any write resets the counters */
++static ssize_t cake_mq_stats_write(struct file *file, const char __user *buf,
++				   size_t count, loff_t *ppos)
++{
++	int d, i;
++
++	for (d = 0; d < 2; d++) {
++		atomic64_set(&g_mq_stats[d].syncs, 0);
++		for (i = 0; i < CAKE_MAX_TINS; i++)
++			atomic64_set(&g_mq_stats[d].tin_nact_sum[i], 0);
++	}
++	return count;
++}
++DEFINE_SHOW_STORE_ATTRIBUTE(cake_mq_stats);
++
+ static int __init cake_module_init(void)
+ {
+ 	int ret;
+@@ -3352,14 +3488,23 @@
+ 		return ret;
+ 
+ 	ret = register_qdisc(&cake_mq_qdisc_ops);
+-	if (ret)
++	if (ret) {
+ 		unregister_qdisc(&cake_qdisc_ops);
++		return ret;
++	}
+ 
+-	return ret;
++	cake_mq_dbg = debugfs_create_dir("cake_mq", NULL);
++	debugfs_create_u32("tin_share", 0644, cake_mq_dbg, &g_mq_tin_share);
++	debugfs_create_u32("tin_hold", 0644, cake_mq_dbg, &g_mq_tin_hold);
++	debugfs_create_u32("active_hold", 0644, cake_mq_dbg, &g_mq_active_hold);
++	debugfs_create_file("stats", 0644, cake_mq_dbg, NULL, &cake_mq_stats_fops);
++
++	return 0;
+ }
+ 
+ static void __exit cake_module_exit(void)
+ {
++	debugfs_remove_recursive(cake_mq_dbg);
+ 	unregister_qdisc(&cake_qdisc_ops);
+ 	unregister_qdisc(&cake_mq_qdisc_ops);
+ }

@@ -1,0 +1,128 @@
+From: Segalmen <249970175+Segalmen@users.noreply.github.com>
+Subject: [PATCH] net/sched: sch_cake: cake_mq tin_cap on top of per-tin active share
+
+With tin_share=1 (patch 720), a priority tin concentrated on one cake_mq
+instance gets its global threshold (e.g. Voice = rate/4 in diffserv4).
+With 4 active instances that equals the whole instance rate, so a large
+priority-marked flow keeps priority up to the full instance rate and the
+lower tins on that instance get almost nothing (measured: ping in the
+Video tin sharing the queue of an 800 Mbit/s CS4 flow, 105-114 ms max;
+stock cake_mq and an unmarked flow of the same rate: < 4 ms).
+
+New runtime knob, off by default (debugfs cake_mq/tin_cap):
+  0     = unchanged (patch 720 behaviour)
+  1-100 = with tin_share, the threshold of a limited tin (threshold below
+          the full rate) never exceeds tin_cap % of this instance's rate.
+          The full-rate (best effort) tin is left alone.
+
+Changing it takes effect at the next sync (sync_time, 200 us default).
+
+Counters: the cake_mq/stats lines get "tin_capped" per tin appended
+(number of syncs where the cap was applied); the fields before it are
+unchanged, so existing parsers keep working.
+
+Applies on top of patch 720.
+---
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -282,16 +282,22 @@
+  *               after its last dequeue (default 8)
+  *  active_hold: 0 = upstream activity test; N = an instance counts as
+  *               active if it sent within the last N * sync_time
++ *  tin_cap:     0 = off; N (1..100) = with tin_share, a limited tin's
++ *               threshold never exceeds N % of its instance's rate, so
++ *               a priority tin cannot starve the lower tins of that
++ *               instance
+  */
+ static u32 g_mq_tin_share;
+ static u32 g_mq_tin_hold = 8;
+ static u32 g_mq_active_hold;
++static u32 g_mq_tin_cap;
+ static struct dentry *cake_mq_dbg;
+ 
+ /* verification counters, index 0 = egress, 1 = ingress */
+ struct cake_mq_stats {
+ 	atomic64_t syncs;
+ 	atomic64_t tin_nact_sum[CAKE_MAX_TINS];
++	atomic64_t tin_capped[CAKE_MAX_TINS];
+ };
+ 
+ static struct cake_mq_stats g_mq_stats[2];
+@@ -2072,6 +2078,9 @@
+ 		unsigned int ntx;
+ 		u64 rate = q->config->rate_bps;
+ 		u32 tin_share = READ_ONCE(g_mq_tin_share);
++		u32 tin_cap = min_t(u32, READ_ONCE(g_mq_tin_cap), 100);
++		u32 capped_mask = 0;
++		u64 cap = 0;
+ 		u64 hold = (u64)READ_ONCE(g_mq_active_hold) * q->config->sync_time;
+ 		u64 tin_hold = (u64)max_t(u32, READ_ONCE(g_mq_tin_hold), 1) *
+ 			       q->config->sync_time;
+@@ -2118,13 +2127,26 @@
+ 			 * the instance shaper keeps its local share
+ 			 */
+ 			cake_configure_rates(sch, rate, true);
++			cap = div64_u64(new_rate * tin_cap, 100);
+ 			for (ntx = 0; ntx < q->tin_cnt; ntx++) {
+ 				struct cake_tin_data *b = &q->tins[ntx];
+ 				u32 n = tin_others[ntx] + 1;
++				u64 thr = b->tin_rate_bps;
+ 
+-				if (n > 1 && b->tin_rate_bps)
+-					cake_set_rate(b, div_u64(b->tin_rate_bps, n),
+-						      0, 0, 0);
++				if (!thr)
++					continue;
++				if (n > 1)
++					thr = div_u64(thr, n);
++				/* tin_cap: a limited tin (threshold below the full
++				 * rate) never exceeds tin_cap % of this instance's
++				 * rate; the full-rate (best effort) tin is left alone
++				 */
++				if (tin_cap && b->tin_rate_bps < rate && thr > cap) {
++					thr = cap;
++					capped_mask |= BIT(ntx);
++				}
++				if (thr != b->tin_rate_bps)
++					cake_set_rate(b, thr, 0, 0, 0);
+ 			}
+ 			cake_mq_set_shaper_rate(q, new_rate);
+ 		} else {
+@@ -2142,6 +2164,9 @@
+ 				atomic64_add(n, &st->tin_nact_sum[ntx]);
+ 			}
+ 		}
++		for (ntx = 0; capped_mask && ntx < q->tin_cnt; ntx++)
++			if (capped_mask & BIT(ntx))
++				atomic64_inc(&st->tin_capped[ntx]);
+ 		q->last_checked_active = now;
+ 		q->active_queues = num_active_qs;
+ 	}
+@@ -3461,6 +3486,10 @@
+ 		for (i = 0; i < CAKE_MAX_TINS; i++)
+ 			seq_printf(m, " %lld",
+ 				   (s64)atomic64_read(&st->tin_nact_sum[i]));
++		seq_puts(m, " tin_capped");
++		for (i = 0; i < CAKE_MAX_TINS; i++)
++			seq_printf(m, " %lld",
++				   (s64)atomic64_read(&st->tin_capped[i]));
+ 		seq_puts(m, "\n");
+ 	}
+ 	return 0;
+@@ -3476,6 +3505,8 @@
+ 		atomic64_set(&g_mq_stats[d].syncs, 0);
+ 		for (i = 0; i < CAKE_MAX_TINS; i++)
+ 			atomic64_set(&g_mq_stats[d].tin_nact_sum[i], 0);
++		for (i = 0; i < CAKE_MAX_TINS; i++)
++			atomic64_set(&g_mq_stats[d].tin_capped[i], 0);
+ 	}
+ 	return count;
+ }
+@@ -3499,6 +3530,7 @@
+ 	debugfs_create_u32("tin_share", 0644, cake_mq_dbg, &g_mq_tin_share);
+ 	debugfs_create_u32("tin_hold", 0644, cake_mq_dbg, &g_mq_tin_hold);
+ 	debugfs_create_u32("active_hold", 0644, cake_mq_dbg, &g_mq_active_hold);
++	debugfs_create_u32("tin_cap", 0644, cake_mq_dbg, &g_mq_tin_cap);
+ 	debugfs_create_file("stats", 0644, cake_mq_dbg, NULL, &cake_mq_stats_fops);
+ 
+ 	return 0;
