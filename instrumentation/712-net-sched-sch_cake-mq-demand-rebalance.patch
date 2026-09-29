@@ -1,0 +1,154 @@
+From: Segalmen <249970175+Segalmen@users.noreply.github.com>
+Subject: [PATCH] net/sched: sch_cake: experimental demand-aware cake_mq rebalance
+
+Upstream cake_mq splits the global rate equally between active
+sub-instances (rate / num_active_qs). When traffic is unevenly spread
+across TX queues, lightly loaded instances leave part of their share
+unused while busier ones are capped and drop.
+
+This experimental hack adds an optional water-filling split:
+ - each instance publishes its smoothed served rate and whether it was
+   shaper-limited (saturated) during the last sync interval;
+ - a non-saturated instance keeps its served rate + 25% headroom
+   (never below rate/32);
+ - saturated instances share what is left of the global rate.
+The sum of local rates stays at the global rate. Lockless, same
+READ_ONCE/WRITE_ONCE pattern as the existing sync code.
+
+Disabled by default. Runtime toggle:
+  echo 1 > /sys/kernel/debug/cake_mq/rebalance
+Requires the 710 sync_time debugfs hack.
+---
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -83,6 +83,10 @@
+ #define CAKE_FLOW_MASK 63
+ #define CAKE_FLOW_NAT_FLAG 64
+ static u64 g_sync_time_ns = 200*NSEC_PER_USEC;
++/* experimental: demand-aware rate split between cake_mq sub-instances
++ * (0 = upstream equal split, 1 = rebalance). Runtime toggle via debugfs.
++ */
++static u32 g_mq_rebalance;
+ static struct dentry *cake_mq_debugfs;
+ 
+ /* struct cobalt_params - contains codel and blue parameters
+@@ -268,6 +272,13 @@
+ 	u64		last_checked_active;
+ 	u64		last_active;
+ 	u32		active_queues;
++
++	/* mq demand rebalance state (experimental) */
++	u64		rb_bytes;	/* bytes charged to shaper since last sync */
++	u64		rb_rate;	/* smoothed served rate, bytes/s (published) */
++	u64		rb_cap;		/* local rate applied at last sync, bytes/s */
++	u32		rb_overlimits;	/* overlimits counter at last sync */
++	u8		rb_saturated;	/* shaper-limited during last interval (published) */
+ };
+ 
+ enum {
+@@ -1371,6 +1382,14 @@
+ 	return avg;
+ }
+ 
++/* rate reserved for a non-saturated cake_mq sub-instance:
++ * its smoothed served rate + 25% headroom, never below floor.
++ */
++static u64 cake_mq_light_cap(u64 served, u64 floor)
++{
++	return max_t(u64, served + (served >> 2), floor);
++}
++
+ static u32 cake_calc_overhead(struct cake_sched_data *qd, u32 len, u32 off)
+ {
+ 	struct cake_sched_config *q = qd->config;
+@@ -2024,6 +2043,32 @@
+ 		struct Qdisc *other_sch;
+ 		u32 num_active_qs = 1;
+ 		unsigned int ntx;
++		bool rebalance = READ_ONCE(g_mq_rebalance);
++		u64 rate = q->config->rate_bps;
++		u64 floor = rate >> 5;
++		u64 light_sum = 0;
++		u32 num_sat = 0;
++
++		if (rebalance) {
++			u64 dt = now - q->last_checked_active;
++			u64 cap = q->rb_cap ? q->rb_cap : rate;
++			u32 ol = sch->qstats.overlimits;
++			u64 r = 0;
++			u8 sat;
++
++			if (q->last_checked_active && dt)
++				r = div64_u64(q->rb_bytes * NSEC_PER_SEC, dt);
++			/* saturated = throttled by the shaper this interval
++			 * while serving close to its local cap (>= 7/8)
++			 */
++			sat = ol != q->rb_overlimits && r >= cap - (cap >> 3);
++			q->rb_bytes = 0;
++			q->rb_overlimits = ol;
++			WRITE_ONCE(q->rb_rate, cake_ewma(q->rb_rate, r, 2));
++			WRITE_ONCE(q->rb_saturated, sat);
++			if (sat)
++				num_sat++;
++		}
+ 
+ 		for (ntx = 0; ntx < dev->num_tx_queues; ntx++) {
+ 			other_sch = rcu_dereference(netdev_get_tx_queue(dev, ntx)->qdisc_sleeping);
+@@ -2035,13 +2080,32 @@
+ 			other_qlen = READ_ONCE(other_sch->q.qlen);
+ 			other_last_active = READ_ONCE(other_priv->last_active);
+ 
+-			if (other_qlen || other_last_active > q->last_checked_active)
++			if (other_qlen || other_last_active > q->last_checked_active) {
+ 				num_active_qs++;
++				if (rebalance) {
++					if (READ_ONCE(other_priv->rb_saturated))
++						num_sat++;
++					else
++						light_sum += cake_mq_light_cap(
++							READ_ONCE(other_priv->rb_rate), floor);
++				}
++			}
+ 		}
+ 
+ 		if (num_active_qs > 1)
+ 			new_rate = div64_u64(q->config->rate_bps, num_active_qs);
+ 
++		if (rebalance && num_active_qs > 1) {
++			if (q->rb_saturated)
++				/* share what the non-saturated instances leave */
++				new_rate = light_sum + floor < rate ?
++					   div64_u64(rate - light_sum, num_sat) : floor;
++			else
++				new_rate = cake_mq_light_cap(q->rb_rate, floor);
++			new_rate = clamp_t(u64, new_rate, floor, rate);
++		}
++		q->rb_cap = new_rate;
++
+ 		cake_configure_rates(sch, new_rate, true);
+ 		q->last_checked_active = now;
+ 		q->active_queues = num_active_qs;
+@@ -2232,6 +2296,7 @@
+ 		if (q->config->rate_flags & CAKE_FLAG_INGRESS) {
+ 			len = cake_advance_shaper(q, b, skb,
+ 						  now, true);
++			q->rb_bytes += len;
+ 			flow->deficit -= len;
+ 			b->tin_deficit -= len;
+ 		}
+@@ -2257,6 +2322,7 @@
+ 				  delay < b->base_delay ? 2 : 8);
+ 
+ 	len = cake_advance_shaper(q, b, skb, now, false);
++	q->rb_bytes += len;
+ 	flow->deficit -= len;
+ 	b->tin_deficit -= len;
+ 
+@@ -3363,6 +3429,7 @@
+ 		struct dentry *cake_mq_debugfs = debugfs_create_dir("cake_mq", NULL);
+ 
+ 		debugfs_create_u64("sync_time_ns", 0644, cake_mq_debugfs, &g_sync_time_ns);
++		debugfs_create_u32("rebalance", 0644, cake_mq_debugfs, &g_mq_rebalance);
+ 	}
+ 
+ 	return ret;

@@ -1,0 +1,234 @@
+From: Segalmen <249970175+Segalmen@users.noreply.github.com>
+Subject: [PATCH] net/sched: sch_cake: experimental cake_mq tuning knobs + v2
+
+Runtime knobs under /sys/kernel/debug/cake_mq/ to explore the cake_mq
+rate split without rebuilding (all default to upstream behaviour):
+
+  rebalance          0 = upstream equal split (default)
+                     1 = v1: light cap = served + headroom,
+                         saturated share the rest
+                     2 = v2: never below the equal share; saturated
+                         instances also get the unused part of the
+                         equal share of non-saturated ones
+  active_hold        0 = upstream activity test (default)
+                     N = an instance stays active if it sent within
+                         the last N * sync_time (smooths the count)
+  ewma_shift         served-rate smoothing, 1..8 (default 2)
+  v1_headroom_shift  v1 headroom = served >> shift (default 2 = 25%)
+  v1_sat_shift       v1 saturated if served >= cap - cap >> shift
+                     (default 3 = 7/8)
+  v2_spare_pct       v2: % of unused share redistributed, 0..100
+                     (default 100)
+
+stats gains an overcommit counter (syncs where the sum of the local
+rates of active instances exceeds the global rate, and the excess),
+so the cost of each setting in terms of rate conformance is visible.
+
+Saturation now means "throttled with a backlog" except in v1 mode,
+where the v1 criterion is kept.
+
+Requires the 710, 712 and 713 hacks.
+---
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -87,7 +87,12 @@
+ /* experimental: demand-aware rate split between cake_mq sub-instances
+  * (0 = upstream equal split, 1 = rebalance). Runtime toggle via debugfs.
+  */
+-static u32 g_mq_rebalance;
++static u32 g_mq_rebalance;		/* 0 = upstream, 1 = v1, 2 = v2 */
++static u32 g_mq_active_hold;		/* 0 = upstream, N = active if seen in last N sync_time */
++static u32 g_mq_ewma_shift = 2;		/* served-rate smoothing, 1..8 */
++static u32 g_mq_v1_headroom_shift = 2;	/* v1: light cap = rate + rate >> shift */
++static u32 g_mq_v1_sat_shift = 3;	/* v1: saturated if served >= cap - cap >> shift */
++static u32 g_mq_v2_spare_pct = 100;	/* v2: % of unused share given to saturated, 0..100 */
+ 
+ /* experimental: cake_mq sync instrumentation (read-only counters),
+  * index 0 = egress instances, 1 = ingress (IFB) instances.
+@@ -100,6 +105,8 @@
+ 	atomic64_t nact_changes;		/* active count changed */
+ 	atomic64_t saturated;			/* self saturated at sync */
+ 	atomic64_t rate_kbs_sum;		/* local rate, KiB/s */
++	atomic64_t overcommit;			/* syncs where sum of caps > rate */
++	atomic64_t overcommit_kbs_sum;		/* excess over rate, KiB/s */
+ };
+ 
+ static struct cake_mq_stats g_mq_stats[2];
+@@ -1399,11 +1406,11 @@
+ }
+ 
+ /* rate reserved for a non-saturated cake_mq sub-instance:
+- * its smoothed served rate + 25% headroom, never below floor.
++ * its smoothed served rate + headroom (1/2^shift), never below floor.
+  */
+-static u64 cake_mq_light_cap(u64 served, u64 floor)
++static u64 cake_mq_light_cap(u64 served, u64 floor, u32 shift)
+ {
+-	return max_t(u64, served + (served >> 2), floor);
++	return max_t(u64, served + (served >> shift), floor);
+ }
+ 
+ static u32 cake_calc_overhead(struct cake_sched_data *qd, u32 len, u32 off)
+@@ -2059,10 +2066,18 @@
+ 		struct Qdisc *other_sch;
+ 		u32 num_active_qs = 1;
+ 		unsigned int ntx;
+-		bool rebalance = READ_ONCE(g_mq_rebalance);
++		u32 mode = READ_ONCE(g_mq_rebalance);
++		u64 hold = (u64)READ_ONCE(g_mq_active_hold) * g_sync_time_ns;
++		u32 ewma_shift = clamp_t(u32, READ_ONCE(g_mq_ewma_shift), 1, 8);
++		u32 head_shift = clamp_t(u32, READ_ONCE(g_mq_v1_headroom_shift), 1, 8);
++		u32 sat_shift = clamp_t(u32, READ_ONCE(g_mq_v1_sat_shift), 1, 8);
++		u32 spare_pct = min_t(u32, READ_ONCE(g_mq_v2_spare_pct), 100);
+ 		u64 rate = q->config->rate_bps;
+ 		u64 floor = rate >> 5;
+-		u64 light_sum = 0;
++		u64 light_sum = 0;	/* v1: caps reserved by non-saturated others */
++		u64 light_rate = 0;	/* v2: served rate of non-saturated others */
++		u64 caps_sum = 0;	/* stats: caps of active others */
++		u32 num_light = 0;
+ 		u32 num_sat = 0;
+ 		struct cake_mq_stats *st;
+ 
+@@ -2070,24 +2085,29 @@
+ 			u64 dt = now - q->last_checked_active;
+ 			u64 cap = q->rb_cap ? q->rb_cap : rate;
+ 			u32 ol = sch->qstats.overlimits;
++			bool throttled = ol != q->rb_overlimits;
+ 			u64 r = 0;
+ 			u8 sat;
+ 
+ 			if (q->last_checked_active && dt)
+ 				r = div64_u64(q->rb_bytes * NSEC_PER_SEC, dt);
+-			/* saturated = throttled by the shaper this interval
+-			 * while serving close to its local cap (>= 7/8)
+-			 */
+-			sat = ol != q->rb_overlimits && r >= cap - (cap >> 3);
++			if (mode == 1)
++				/* v1: throttled while serving close to its cap */
++				sat = throttled && r >= cap - (cap >> sat_shift);
++			else
++				/* v2: throttled with a backlog still queued */
++				sat = throttled && sch->q.qlen;
+ 			q->rb_bytes = 0;
+ 			q->rb_overlimits = ol;
+-			WRITE_ONCE(q->rb_rate, cake_ewma(q->rb_rate, r, 2));
++			WRITE_ONCE(q->rb_rate, cake_ewma(q->rb_rate, r, ewma_shift));
+ 			WRITE_ONCE(q->rb_saturated, sat);
+ 			if (sat)
+ 				num_sat++;
+ 		}
+ 
+ 		for (ntx = 0; ntx < dev->num_tx_queues; ntx++) {
++			bool active;
++
+ 			other_sch = rcu_dereference(netdev_get_tx_queue(dev, ntx)->qdisc_sleeping);
+ 			other_priv = qdisc_priv(other_sch);
+ 
+@@ -2097,31 +2117,54 @@
+ 			other_qlen = READ_ONCE(other_sch->q.qlen);
+ 			other_last_active = READ_ONCE(other_priv->last_active);
+ 
+-			if (other_qlen || other_last_active > q->last_checked_active) {
+-				num_active_qs++;
+-				if (rebalance) {
+-					if (READ_ONCE(other_priv->rb_saturated))
+-						num_sat++;
+-					else
+-						light_sum += cake_mq_light_cap(
+-							READ_ONCE(other_priv->rb_rate), floor);
+-				}
++			if (hold)
++				active = other_qlen || other_last_active + hold >= now;
++			else
++				active = other_qlen ||
++					 other_last_active > q->last_checked_active;
++			if (!active)
++				continue;
++
++			num_active_qs++;
++			caps_sum += READ_ONCE(other_priv->rb_cap);
++			if (!mode)
++				continue;
++			if (READ_ONCE(other_priv->rb_saturated)) {
++				num_sat++;
++			} else {
++				u64 r = READ_ONCE(other_priv->rb_rate);
++
++				num_light++;
++				light_rate += r;
++				light_sum += cake_mq_light_cap(r, floor, head_shift);
+ 			}
+ 		}
+ 
+ 		if (num_active_qs > 1)
+ 			new_rate = div64_u64(q->config->rate_bps, num_active_qs);
+ 
+-		if (rebalance && num_active_qs > 1) {
++		if (mode == 1 && num_active_qs > 1) {
+ 			if (q->rb_saturated)
+ 				/* share what the non-saturated instances leave */
+ 				new_rate = light_sum + floor < rate ?
+ 					   div64_u64(rate - light_sum, num_sat) : floor;
+ 			else
+-				new_rate = cake_mq_light_cap(q->rb_rate, floor);
++				new_rate = cake_mq_light_cap(q->rb_rate, floor,
++							     head_shift);
+ 			new_rate = clamp_t(u64, new_rate, floor, rate);
++		} else if (mode == 2 && num_active_qs > 1 && q->rb_saturated) {
++			/* never below the equal share; saturated instances
++			 * also get the part of the equal share that
++			 * non-saturated ones do not use
++			 */
++			u64 eq = new_rate;
++			u64 spare = num_light * eq > light_rate ?
++				    num_light * eq - light_rate : 0;
++
++			spare = div64_u64(spare * spare_pct, 100);
++			new_rate = min_t(u64, eq + div64_u64(spare, num_sat), rate);
+ 		}
+-		q->rb_cap = new_rate;
++		WRITE_ONCE(q->rb_cap, new_rate);
+ 
+ 		st = &g_mq_stats[!!(q->config->rate_flags & CAKE_FLAG_INGRESS)];
+ 		atomic64_inc(&st->syncs);
+@@ -2131,6 +2174,12 @@
+ 		if (q->rb_saturated)
+ 			atomic64_inc(&st->saturated);
+ 		atomic64_add(new_rate >> 10, &st->rate_kbs_sum);
++		caps_sum += new_rate;
++		if (caps_sum > rate) {
++			atomic64_inc(&st->overcommit);
++			atomic64_add((caps_sum - rate) >> 10,
++				     &st->overcommit_kbs_sum);
++		}
+ 
+ 		cake_configure_rates(sch, new_rate, true);
+ 		q->last_checked_active = now;
+@@ -3453,6 +3502,9 @@
+ 			   dir[d], syncs, (s64)atomic64_read(&st->nact_changes),
+ 			   (s64)atomic64_read(&st->saturated),
+ 			   (s64)atomic64_read(&st->rate_kbs_sum));
++		seq_printf(m, "%s: overcommit %lld overcommit_kbs_sum %lld\n",
++			   dir[d], (s64)atomic64_read(&st->overcommit),
++			   (s64)atomic64_read(&st->overcommit_kbs_sum));
+ 		seq_printf(m, "%s: nact", dir[d]);
+ 		for (i = 0; i < CAKE_MQ_NACT_BINS; i++)
+ 			seq_printf(m, " %lld", (s64)atomic64_read(&st->nact[i]));
+@@ -3480,6 +3532,16 @@
+ 		debugfs_create_u32("rebalance", 0644, cake_mq_debugfs, &g_mq_rebalance);
+ 		debugfs_create_file("stats", 0444, cake_mq_debugfs, NULL,
+ 				    &cake_mq_stats_fops);
++		debugfs_create_u32("active_hold", 0644, cake_mq_debugfs,
++				   &g_mq_active_hold);
++		debugfs_create_u32("ewma_shift", 0644, cake_mq_debugfs,
++				   &g_mq_ewma_shift);
++		debugfs_create_u32("v1_headroom_shift", 0644, cake_mq_debugfs,
++				   &g_mq_v1_headroom_shift);
++		debugfs_create_u32("v1_sat_shift", 0644, cake_mq_debugfs,
++				   &g_mq_v1_sat_shift);
++		debugfs_create_u32("v2_spare_pct", 0644, cake_mq_debugfs,
++				   &g_mq_v2_spare_pct);
+ 	}
+ 
+ 	return ret;

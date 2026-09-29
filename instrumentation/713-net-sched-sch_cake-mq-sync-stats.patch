@@ -1,0 +1,117 @@
+From: Segalmen <249970175+Segalmen@users.noreply.github.com>
+Subject: [PATCH] net/sched: sch_cake: experimental cake_mq sync instrumentation
+
+Read-only counters to understand how cake_mq sub-instances behave
+under real load, split by direction (egress / ingress IFB):
+ - syncs: number of sync events
+ - nact: histogram of the active queue count seen at each sync (1..8+)
+ - nact_changes: syncs where the active queue count changed
+ - saturated: syncs where the instance was shaper-limited while
+   serving >= 7/8 of its local rate
+ - rate_kbs_sum: sum of local rates applied (KiB/s), for averaging
+
+The served-rate / saturation measurement from the rebalance hack is
+now always computed so the counters also work with rebalance=0.
+No effect on the rate split itself.
+
+  cat /sys/kernel/debug/cake_mq/stats
+
+Requires the 710 and 712 hacks.
+---
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -72,6 +72,7 @@
+ #include <net/tcp.h>
+ #include <net/flow_dissector.h>
+ #include <linux/debugfs.h>
++#include <linux/seq_file.h>
+ 
+ #if IS_ENABLED(CONFIG_NF_CONNTRACK)
+ #include <net/netfilter/nf_conntrack_core.h>
+@@ -87,6 +88,21 @@
+  * (0 = upstream equal split, 1 = rebalance). Runtime toggle via debugfs.
+  */
+ static u32 g_mq_rebalance;
++
++/* experimental: cake_mq sync instrumentation (read-only counters),
++ * index 0 = egress instances, 1 = ingress (IFB) instances.
++ * Read with: cat /sys/kernel/debug/cake_mq/stats
++ */
++#define CAKE_MQ_NACT_BINS 8
++struct cake_mq_stats {
++	atomic64_t syncs;
++	atomic64_t nact[CAKE_MQ_NACT_BINS];	/* active queues 1..8+ */
++	atomic64_t nact_changes;		/* active count changed */
++	atomic64_t saturated;			/* self saturated at sync */
++	atomic64_t rate_kbs_sum;		/* local rate, KiB/s */
++};
++
++static struct cake_mq_stats g_mq_stats[2];
+ static struct dentry *cake_mq_debugfs;
+ 
+ /* struct cobalt_params - contains codel and blue parameters
+@@ -2048,8 +2064,9 @@
+ 		u64 floor = rate >> 5;
+ 		u64 light_sum = 0;
+ 		u32 num_sat = 0;
++		struct cake_mq_stats *st;
+ 
+-		if (rebalance) {
++		{
+ 			u64 dt = now - q->last_checked_active;
+ 			u64 cap = q->rb_cap ? q->rb_cap : rate;
+ 			u32 ol = sch->qstats.overlimits;
+@@ -2106,6 +2123,15 @@
+ 		}
+ 		q->rb_cap = new_rate;
+ 
++		st = &g_mq_stats[!!(q->config->rate_flags & CAKE_FLAG_INGRESS)];
++		atomic64_inc(&st->syncs);
++		atomic64_inc(&st->nact[min_t(u32, num_active_qs, CAKE_MQ_NACT_BINS) - 1]);
++		if (num_active_qs != q->active_queues)
++			atomic64_inc(&st->nact_changes);
++		if (q->rb_saturated)
++			atomic64_inc(&st->saturated);
++		atomic64_add(new_rate >> 10, &st->rate_kbs_sum);
++
+ 		cake_configure_rates(sch, new_rate, true);
+ 		q->last_checked_active = now;
+ 		q->active_queues = num_active_qs;
+@@ -3414,6 +3440,28 @@
+ };
+ MODULE_ALIAS_NET_SCH("cake_mq");
+ 
++static int cake_mq_stats_show(struct seq_file *m, void *v)
++{
++	static const char * const dir[] = { "egress", "ingress" };
++	int d, i;
++
++	for (d = 0; d < 2; d++) {
++		struct cake_mq_stats *st = &g_mq_stats[d];
++		s64 syncs = atomic64_read(&st->syncs);
++
++		seq_printf(m, "%s: syncs %lld nact_changes %lld saturated %lld rate_kbs_sum %lld\n",
++			   dir[d], syncs, (s64)atomic64_read(&st->nact_changes),
++			   (s64)atomic64_read(&st->saturated),
++			   (s64)atomic64_read(&st->rate_kbs_sum));
++		seq_printf(m, "%s: nact", dir[d]);
++		for (i = 0; i < CAKE_MQ_NACT_BINS; i++)
++			seq_printf(m, " %lld", (s64)atomic64_read(&st->nact[i]));
++		seq_puts(m, "\n");
++	}
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(cake_mq_stats);
++
+ static int __init cake_module_init(void)
+ {
+ 	int ret;
+@@ -3430,6 +3478,8 @@
+ 
+ 		debugfs_create_u64("sync_time_ns", 0644, cake_mq_debugfs, &g_sync_time_ns);
+ 		debugfs_create_u32("rebalance", 0644, cake_mq_debugfs, &g_mq_rebalance);
++		debugfs_create_file("stats", 0444, cake_mq_debugfs, NULL,
++				    &cake_mq_stats_fops);
+ 	}
+ 
+ 	return ret;
