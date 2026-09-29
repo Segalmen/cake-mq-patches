@@ -40,6 +40,10 @@ echo 90 > /sys/kernel/debug/cake_mq/tin_cap
 | same, upload | −75 % | −2 % to +9 % | not measured |
 | ping sharing the instance of an 800 Mbit/s priority flow | < 4 ms | 105–217 ms | 2–4 ms |
 
+720 and 729 are validated in diffserv3, diffserv4 and diffserv8 (download,
+same behaviour in the three modes; in diffserv3 the priority flow is EF,
+as CS4 falls into Best Effort): see section 4 of the 729 README.
+
 Details, method and limitations: [720 README](docs/720-cake-mq-per-tin-active-share-README.md),
 [729 README](docs/729-cake-mq-tin-cap-README.md).
 
