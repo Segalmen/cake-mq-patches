@@ -69,3 +69,29 @@ Please open an issue with:
 - anything odd: throughput drops, latency spikes, CPU at 100 %
 
 Negative results are just as useful as positive ones.
+
+## 5. Optional: choosing the instance a flow lands on
+
+With few flows, the hash decides which cake_mq instance carries each flow, so two
+runs of the same test can occupy different instances. On some routers the placement
+can be predicted and chosen. This depends on the router setup: verify it before use.
+
+1. On the LAN-side interface (where the test traffic enters), read the RSS setup:
+   `ethtool -x <lan-if>` (indirection table, key, hash function) and
+   `ethtool -n <lan-if> rx-flow-hash tcp4` (hashed fields).
+2. Read the steering setup: RPS (`/sys/class/net/<lan-if>/queues/rx-*/rps_cpus`),
+   XPS on the WAN interface (`/sys/class/net/<wan-if>/queues/tx-*/xps_cpus`),
+   OpenWrt `network.globals.packet_steering`. Do not assume another router's setup.
+3. If RPS spreads the LAN traffic over N CPUs (no RFS) and XPS maps CPU k to tx
+   queue k, `tools/rss-port-pick.py` predicts the instance of a TCP flow (its
+   assumptions are listed in its header).
+4. Before any experiment, confirm the predictions: short single flows with fixed
+   source ports (`iperf3 --cport`), and check that the per-instance `Sent` byte
+   deltas of `tc -s qdisc show dev <wan-if>` land on the predicted instance.
+5. Use the ports only if every prediction is confirmed. Re-read the RSS key after
+   any reboot or interface change: it is usually regenerated.
+
+Notes: `iperf3 -P N --cport P` uses the ports P to P+N-1; concurrent tests must not
+share local ports; wait about 3 s between two tests on the same server port.
+Result on the tested R86S (8 queues): 32/32 predicted placements confirmed on all
+8 instances, for one RSS key.
