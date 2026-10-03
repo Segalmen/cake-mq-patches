@@ -63,3 +63,7 @@ stock 25.12 cake_mq code.
 ## License
 
 GPL-2.0, like the kernel code they modify.
+
+## Results
+
+- [cake_mq vs plain CAKE on an 8-core router: the `rtt` setting matters](results/2026-10-r86s-rtt/README.md) (R86S, 10 Gbit/s, October 2026)
