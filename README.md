@@ -16,6 +16,9 @@ DiffServ tin thresholds from its **local** share, so priority traffic
 priority it gets with plain cake: about **−75 %** in diffserv4 for a
 single priority flow, in both directions.
 
+A separate issue, still being worked on (not in the published patches),
+is explained without networking jargon in [docs/explained-simply.md](docs/explained-simply.md).
+
 ## The patches
 
 | Patch | Knob (debugfs `cake_mq/`) | What it does |
