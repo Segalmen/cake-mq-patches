@@ -1,4 +1,4 @@
-# Explained simply
+# cake_mq explained simply
 
 > **Status:** this describes work in progress. The mechanism below is not part of the published patches (720, 729) yet.
 
