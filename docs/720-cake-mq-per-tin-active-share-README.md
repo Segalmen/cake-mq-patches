@@ -7,6 +7,23 @@ Feedback and measurements from other hardware are welcome.
 - Target: OpenWrt 25.12 (kernel 6.12 with the cake_mq backport)
 - Default behaviour: **unchanged** — nothing happens until you enable it
 
+> **Update (2026-10-03).** Measured after this README was written; the text
+> below is kept as originally published.
+> - **Upload** (1 priority flow vs 16 Best Effort flows, CS4, diffserv4, same
+>   router, measured 2026-09-28), plain cake / stock cake_mq / this patch,
+>   Mbit/s: 1 flow 501 / 124 / 536 ; 4 flows 546 / 265 / 536 ;
+>   1 large + 3 × 2 Mbit/s 485 / 120 / 529. This patch is within −2 % to +9 %
+>   of plain cake. Single runs, except plain cake for 1 flow and for
+>   large + small (3 runs each, averaged).
+> - **diffserv3 and diffserv8**: this patch restores the priority flow in both
+>   modes (results in the 729 README, section 4). In diffserv3 the priority
+>   flow must be EF: CS4 maps to Best Effort.
+> - **Bursty traffic**, latency only: `active_hold` 0 vs 8 showed no difference
+>   in ping latency (5 runs each); the spikes seen in those runs depended on
+>   flow placement and led to patch 729. Rate over-commit (section 1) was not
+>   re-measured.
+> - All tests used CUBIC; BBR was not tested.
+
 ---
 
 ## 1. What it fixes
@@ -14,7 +31,7 @@ Feedback and measurements from other hardware are welcome.
 With cake_mq, the global rate is split between one CAKE instance per
 hardware queue. At every sync, each instance also recomputes its
 **DiffServ tin thresholds** from its local share. A priority flow (EF,
-CS5, CS4 — e.g. game traffic) that lands on a single instance only gets
+CS5, CS4 — e.g. interactive or real-time traffic) that lands on a single instance only gets
 a fraction of the priority it would get with plain cake.
 
 Measured with this patch on the test bench (download, 2350 Mbit/s,
@@ -62,7 +79,7 @@ flows, 3 × 20 Mbit/s, counted them part of the time; priority traffic
 then got ~3 % more than plain cake.)
 
 **Real classification path.** The same results were obtained with the
-priority flows marked CS4 instead of CS5, and with the gaming QoS
+priority flows marked CS4 instead of CS5, and with a QoS
 script's full ingress path (DSCP restored by `act_ctinfo`, cake_mq and
 all settings applied by the script): 1 CS4 flow 537 (−2 %), large +
 3 × 2 Mbit/s CS4 540 + 6 (+2 %).
